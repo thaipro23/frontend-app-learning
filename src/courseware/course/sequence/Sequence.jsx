@@ -9,6 +9,7 @@ import {
 import { useIntl } from '@edx/frontend-platform/i18n';
 import { useSelector } from 'react-redux';
 import SequenceExamWrapper from '@edx/frontend-lib-special-exams';
+import UnitResetButton from './unit-reset/UnitResetButton';
 
 import PageLoading from '@src/generic/PageLoading';
 import { useModel } from '@src/generic/model-store';
@@ -215,6 +216,10 @@ const Sequence = ({
           </div>
 
           <div className="unit-container flex-grow-1 pt-4">
+            <UnitResetButton
+              courseId={courseId}
+              unitUsageKey={unitId}
+            />
             <SequenceContent
               courseId={courseId}
               gated={gated}
