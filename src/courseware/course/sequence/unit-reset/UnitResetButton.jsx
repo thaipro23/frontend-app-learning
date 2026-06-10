@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { getAuthenticatedHttpClient } from '@edx/frontend-platform/auth';
 import { getConfig } from '@edx/frontend-platform';
 
@@ -42,8 +42,7 @@ function formatClock(seconds) {
   }
 
   return `${mm}:${ss}`;
-}
-
+}\n
 function secondsUntil(dateString) {
   if (!dateString) {
     return null;
@@ -60,6 +59,7 @@ function secondsUntil(dateString) {
 
 function normalizeTimerPayload(data) {
   const session = data?.session || data?.quiz_session || {};
+  const config = data?.config || session?.config || {};
   const rawRemaining = data?.remaining_seconds
     ?? data?.time_remaining_seconds
     ?? data?.remaining_time_seconds
@@ -67,10 +67,12 @@ function normalizeTimerPayload(data) {
     ?? session?.time_remaining_seconds
     ?? secondsUntil(data?.expires_at || session?.expires_at);
   const rawCooldown = data?.cooldown_remaining_seconds
+    ?? data?.reset_wait_seconds
     ?? data?.reset_remaining_seconds
     ?? data?.remaining_cooldown_seconds
     ?? data?.wait_seconds
     ?? session?.cooldown_remaining_seconds
+    ?? session?.reset_wait_seconds
     ?? session?.reset_remaining_seconds
     ?? secondsUntil(data?.reset_available_at || session?.reset_available_at);
   const expiresAt = data?.expires_at || session?.expires_at || null;
@@ -80,6 +82,7 @@ function normalizeTimerPayload(data) {
     || data?.custom_timer_enabled
     || data?.enabled
     || data?.configured
+    || config?.enabled
     || expiresAt
     || rawRemaining !== null,
   );
@@ -90,8 +93,41 @@ function normalizeTimerPayload(data) {
     remainingSeconds: rawRemaining === null || rawRemaining === undefined ? null : Math.max(0, Math.floor(Number(rawRemaining || 0))),
     cooldownSeconds: rawCooldown === null || rawCooldown === undefined ? 0 : Math.max(0, Math.floor(Number(rawCooldown || 0))),
     expiresAt,
+    autoSubmitOnTimeout: data?.auto_submit_on_timeout ?? config?.auto_submit_on_timeout ?? true,
+    lockAfterTimeout: data?.lock_after_timeout ?? config?.lock_after_timeout ?? true,
     message: data?.message || session?.message || '',
   };
+}
+
+function broadcastAutoSubmitToProblemFrames(lmsBaseUrl) {
+  const message = { type: 'AI_QUIZ_TIMEOUT_AUTO_SUBMIT' };
+  const lmsOrigin = (() => {
+    try { return new URL(lmsBaseUrl).origin; } catch (error) { return window.location.origin; }
+  })();
+  const frames = Array.from(document.querySelectorAll('iframe'));
+
+  window.postMessage(message, window.location.origin);
+
+  frames.forEach((frame) => {
+    try {
+      frame.contentWindow?.postMessage(message, lmsOrigin);
+    } catch (error) {
+      // Cross-origin frames can reject direct access. LMS runtime injection handles most rendered problem frames.
+    }
+  });
+}
+
+function loadRuntimeScript(lmsBaseUrl) {
+  const scriptId = 'openedx-unit-reset-quiz-runtime-js';
+  if (document.getElementById(scriptId)) {
+    return;
+  }
+
+  const script = document.createElement('script');
+  script.id = scriptId;
+  script.async = true;
+  script.src = `${lmsBaseUrl}/api/unit-reset/v1/quiz-session/runtime.js`;
+  document.body.appendChild(script);
 }
 
 export default function UnitResetButton({ courseId, sequenceUsageKey, unitUsageKey }) {
@@ -99,6 +135,7 @@ export default function UnitResetButton({ courseId, sequenceUsageKey, unitUsageK
   const [timerLoading, setTimerLoading] = useState(false);
   const [timerUnavailable, setTimerUnavailable] = useState(false);
   const [timer, setTimer] = useState(null);
+  const timeoutHandledRef = useRef(false);
 
   const quizSessionPayload = {
     course_id: courseId,
@@ -124,7 +161,11 @@ export default function UnitResetButton({ courseId, sequenceUsageKey, unitUsageK
             quizSessionPayload,
           );
 
-          setTimer(normalizeTimerPayload(startResponse?.data));
+          const normalized = normalizeTimerPayload(startResponse?.data);
+          setTimer(normalized);
+          if (normalized.timerEnabled) {
+            loadRuntimeScript(lmsBaseUrl);
+          }
           return;
         } catch (startError) {
           if (![404, 405].includes(startError?.response?.status)) {
@@ -138,14 +179,17 @@ export default function UnitResetButton({ courseId, sequenceUsageKey, unitUsageK
         { params: quizSessionPayload },
       );
 
-      setTimer(normalizeTimerPayload(response?.data));
+      const normalized = normalizeTimerPayload(response?.data);
+      setTimer(normalized);
+      if (normalized.timerEnabled) {
+        loadRuntimeScript(lmsBaseUrl);
+      }
     } catch (error) {
       if ([404, 405].includes(error?.response?.status)) {
         setTimerUnavailable(true);
         return;
       }
 
-      // Timer is additive. Do not hide the existing reset button if the timer API fails.
       setTimer(null);
     } finally {
       setTimerLoading(false);
@@ -155,6 +199,7 @@ export default function UnitResetButton({ courseId, sequenceUsageKey, unitUsageK
   useEffect(() => {
     setTimerUnavailable(false);
     setTimer(null);
+    timeoutHandledRef.current = false;
   }, [courseId, unitUsageKey, sequenceUsageKey]);
 
   useEffect(() => {
@@ -184,32 +229,78 @@ export default function UnitResetButton({ courseId, sequenceUsageKey, unitUsageK
   }, [timer?.timerEnabled, timer?.remainingSeconds]);
 
   useEffect(() => {
-    if (!timer?.timerEnabled || timer.remainingSeconds !== 0) {
+    if (!timer?.timerEnabled || timer.remainingSeconds !== 0 || timeoutHandledRef.current) {
       return;
     }
 
-    if (['EXPIRED', 'LOCKED', 'SUBMITTING'].includes(timer.status)) {
+    if (['EXPIRED', 'LOCKED', 'RESET_WAIT', 'RESET_READY'].includes(timer.status)) {
       return;
     }
 
-    const markTimeout = async () => {
+    timeoutHandledRef.current = true;
+
+    const handleTimeout = async () => {
+      const client = getAuthenticatedHttpClient();
+      const lmsBaseUrl = getLmsBaseUrl();
+      let submittedProblemCount = 0;
+
       try {
-        const client = getAuthenticatedHttpClient();
-        const lmsBaseUrl = getLmsBaseUrl();
-
         await client.post(
           `${lmsBaseUrl}/api/unit-reset/v1/quiz-session/timeout`,
           quizSessionPayload,
         );
-
-        setTimer((current) => current ? { ...current, status: 'EXPIRED', message: 'Đã hết giờ làm bài.' } : current);
       } catch (error) {
-        setTimer((current) => current ? { ...current, status: 'EXPIRED' } : current);
+        // Continue to auto-submit/lock even if this call temporarily fails.
       }
+
+      if (timer.autoSubmitOnTimeout) {
+        submittedProblemCount = await new Promise((resolve) => {
+          let resolved = false;
+          const done = (event) => {
+            if (event?.data?.type !== 'AI_QUIZ_TIMEOUT_AUTO_SUBMIT_DONE') {
+              return;
+            }
+            resolved = true;
+            window.removeEventListener('message', done);
+            resolve(Number(event.data.submitted_problem_count || 0));
+          };
+          window.addEventListener('message', done);
+          broadcastAutoSubmitToProblemFrames(lmsBaseUrl);
+          window.setTimeout(() => {
+            if (!resolved) {
+              window.removeEventListener('message', done);
+              resolve(0);
+            }
+          }, 8000);
+        });
+      }
+
+      if (timer.lockAfterTimeout) {
+        try {
+          await client.post(
+            `${lmsBaseUrl}/api/unit-reset/v1/quiz-session/lock`,
+            {
+              ...quizSessionPayload,
+              submitted_problem_count: submittedProblemCount,
+              auto_submit_done: true,
+            },
+          );
+        } catch (error) {
+          // Server guard will still block late submits when the session expires.
+        }
+      }
+
+      setTimer((current) => current ? {
+        ...current,
+        status: 'EXPIRED',
+        remainingSeconds: 0,
+        message: 'Đã hết giờ. Hệ thống đã tự nộp các câu bạn đã chọn và khóa lượt làm này.',
+      } : current);
+      await loadTimerStatus();
     };
 
-    markTimeout();
-  }, [timer?.timerEnabled, timer?.remainingSeconds, timer?.status, courseId, sequenceUsageKey, unitUsageKey]);
+    handleTimeout();
+  }, [timer?.timerEnabled, timer?.remainingSeconds, timer?.status, timer?.autoSubmitOnTimeout, timer?.lockAfterTimeout, courseId, sequenceUsageKey, unitUsageKey, loadTimerStatus]);
 
   if (!courseId || !unitUsageKey) {
     return null;
@@ -233,9 +324,12 @@ export default function UnitResetButton({ courseId, sequenceUsageKey, unitUsageK
     try {
       const client = getAuthenticatedHttpClient();
       const lmsBaseUrl = getLmsBaseUrl();
+      const endpoint = timer?.timerEnabled
+        ? `${lmsBaseUrl}/api/unit-reset/v1/quiz-session/reset`
+        : `${lmsBaseUrl}/api/unit-reset/v1/reset/`;
 
       const response = await client.post(
-        `${lmsBaseUrl}/api/unit-reset/v1/reset/`,
+        endpoint,
         {
           course_id: courseId,
           sequence_usage_key: sequenceUsageKey,
@@ -251,6 +345,27 @@ export default function UnitResetButton({ courseId, sequenceUsageKey, unitUsageK
       window.alert(response?.data?.message || 'Không thể làm lại bài.');
     } catch (error) {
       const data = error?.response?.data;
+
+      if (error?.response?.status === 404 && timer?.timerEnabled) {
+        try {
+          const client = getAuthenticatedHttpClient();
+          const lmsBaseUrl = getLmsBaseUrl();
+          const response = await client.post(
+            `${lmsBaseUrl}/api/unit-reset/v1/reset/`,
+            {
+              course_id: courseId,
+              sequence_usage_key: sequenceUsageKey,
+              unit_usage_key: unitUsageKey,
+            },
+          );
+          if (response?.data?.success === true || response?.data?.ok === true) {
+            window.location.reload();
+            return;
+          }
+        } catch (fallbackError) {
+          // Continue to normal error handling below.
+        }
+      }
 
       if (data?.code === 'RESET_COOLDOWN' || data?.error_code === 'cooldown_not_expired') {
         const waitSeconds = data?.wait_seconds || data?.remaining_seconds || data?.cooldown_remaining_seconds || 0;
@@ -297,7 +412,7 @@ export default function UnitResetButton({ courseId, sequenceUsageKey, unitUsageK
 
       {showTimer && isExpired && (
         <div className="alert alert-warning py-2 mb-3">
-          Đã hết giờ. Hệ thống sẽ khóa lượt làm theo cấu hình của quiz.
+          Đã hết giờ. Hệ thống đã tự nộp các câu bạn đã chọn và khóa lượt làm này.
         </div>
       )}
 
