@@ -218,6 +218,7 @@ const Sequence = ({
           <div className="unit-container flex-grow-1 pt-4">
             <UnitResetButton
               courseId={courseId}
+              sequenceUsageKey={sequenceId}
               unitUsageKey={unitId}
             />
             <SequenceContent
