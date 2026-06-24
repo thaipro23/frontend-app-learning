@@ -104,9 +104,71 @@ function hasFreshQuizSession(normalized) {
   return normalized?.timerEnabled && ['ACTIVE', 'SUBMITTING'].includes(String(normalized.status || '').toUpperCase());
 }
 
+function getFrameSrc(frame) {
+  if (!frame) return '';
+  return frame.getAttribute('src') || frame.src || '';
+}
+
+function looksLikeUnitIframe(frame, unitUsageKey) {
+  const rawSrc = getFrameSrc(frame);
+  if (!rawSrc) return false;
+  const decodedSrc = (() => {
+    try { return decodeURIComponent(rawSrc); } catch (error) { return rawSrc; }
+  })();
+  return decodedSrc.includes('/xblock/')
+    || decodedSrc.includes('block-v1:')
+    || decodedSrc.includes(unitUsageKey || '')
+    || frame.id === 'unit-iframe';
+}
+
+function getUnitIframes(unitUsageKey) {
+  const frames = Array.from(document.querySelectorAll('iframe'));
+  const byId = document.getElementById('unit-iframe');
+  const candidates = [];
+  if (byId) candidates.push(byId);
+  frames.forEach((frame) => {
+    if (looksLikeUnitIframe(frame, unitUsageKey) && !candidates.includes(frame)) candidates.push(frame);
+  });
+  return candidates;
+}
+
+function postActiveSessionReloadToFrames({ unitUsageKey, reason, token }) {
+  const message = {
+    type: 'AI_QUIZ_ACTIVE_SESSION_READY_RELOAD',
+    unit_usage_key: unitUsageKey,
+    reason,
+    token: String(token || Date.now()),
+  };
+  Array.from(document.querySelectorAll('iframe')).forEach((frame) => {
+    try { frame.contentWindow?.postMessage(message, '*'); } catch (error) { /* ignore cross-origin frame access */ }
+  });
+}
+
+function reloadFrameWithNonce(frame, { unitUsageKey, reason, token }) {
+  const rawSrc = getFrameSrc(frame);
+  if (!rawSrc) return false;
+  const url = new URL(rawSrc, window.location.href);
+  url.searchParams.set('unit_reset_nonce', String(token || Date.now()));
+  url.searchParams.set('unit_reset_reason', reason);
+  url.searchParams.set('unit_reset_unit', unitUsageKey || '');
+
+  // Replace the iframe element instead of only assigning src. Some Learning MFE
+  // versions keep the old XBlock DOM alive after timeout/reset; cloning forces a
+  // clean iframe document without touching native Open edX Submit/Check buttons.
+  const nextFrame = frame.cloneNode(false);
+  nextFrame.src = url.toString();
+  nextFrame.dataset.openedxUnitResetReloadReason = reason;
+  try {
+    frame.parentNode?.insertBefore(nextFrame, frame.nextSibling);
+    frame.parentNode?.removeChild(frame);
+  } catch (error) {
+    frame.src = url.toString();
+  }
+  return true;
+}
+
 function reloadUnitIframeOnce({ courseId, unitUsageKey, data, reason }) {
-  const iframe = document.getElementById('unit-iframe');
-  const token = getTimerSessionToken(data);
+  const token = getTimerSessionToken(data) || Date.now();
   const storageKey = `openedx-unit-reset:iframe-reloaded:${courseId}:${unitUsageKey}:${reason}:${token}`;
 
   try {
@@ -116,21 +178,33 @@ function reloadUnitIframeOnce({ courseId, unitUsageKey, data, reason }) {
     // sessionStorage can be unavailable in strict browser modes. Reloading the iframe is still safe.
   }
 
-  if (!iframe) {
-    window.location.reload();
-    return true;
-  }
+  const reloadNow = () => {
+    postActiveSessionReloadToFrames({ unitUsageKey, reason, token });
+    const iframes = getUnitIframes(unitUsageKey);
+    let didReload = false;
+    iframes.forEach((frame) => {
+      didReload = reloadFrameWithNonce(frame, { unitUsageKey, reason, token }) || didReload;
+    });
+    return didReload;
+  };
 
-  const rawSrc = iframe.getAttribute('src') || iframe.src;
-  if (!rawSrc) {
-    window.location.reload();
-    return true;
-  }
+  if (reloadNow()) return true;
 
-  const url = new URL(rawSrc, window.location.href);
-  url.searchParams.set('unit_reset_nonce', String(Date.now()));
-  url.searchParams.set('unit_reset_reason', reason);
-  iframe.src = url.toString();
+  // The UnitResetButton can mount before the unit iframe exists. Retry briefly
+  // instead of immediately reloading the whole MFE, which can recreate the same
+  // race where /xblock renders before quiz-session/start.
+  let attempts = 0;
+  const retry = window.setInterval(() => {
+    attempts += 1;
+    if (reloadNow()) {
+      window.clearInterval(retry);
+      return;
+    }
+    if (attempts >= 20) {
+      window.clearInterval(retry);
+      window.location.reload();
+    }
+  }, 250);
   return true;
 }
 
