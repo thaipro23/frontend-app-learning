@@ -100,6 +100,10 @@ function getTimerSessionToken(data) {
     || 'active';
 }
 
+function hasFreshQuizSession(normalized) {
+  return normalized?.timerEnabled && ['ACTIVE', 'SUBMITTING'].includes(String(normalized.status || '').toUpperCase());
+}
+
 function reloadUnitIframeOnce({ courseId, unitUsageKey, data, reason }) {
   const iframe = document.getElementById('unit-iframe');
   const token = getTimerSessionToken(data);
@@ -171,14 +175,16 @@ export default function UnitResetButton({ courseId, sequenceUsageKey, unitUsageK
           setTimer(normalized);
           if (normalized.timerEnabled) {
             loadRuntimeScript(lmsBaseUrl);
-            // The LMS unit iframe may render before the ACTIVE quiz session exists.
-            // Reload it once after a successful start so CAPA/problem JS initializes against fresh state.
-            reloadUnitIframeOnce({
-              courseId,
-              unitUsageKey,
-              data: startResponse?.data,
-              reason: 'quiz-session-start',
-            });
+            if (hasFreshQuizSession(normalized)) {
+              // The LMS unit iframe may render before the ACTIVE quiz session exists.
+              // Reload it once only after the server confirms a fresh usable session.
+              reloadUnitIframeOnce({
+                courseId,
+                unitUsageKey,
+                data: startResponse?.data,
+                reason: 'quiz-session-start',
+              });
+            }
           }
           return;
         } catch (startError) {
@@ -296,12 +302,17 @@ export default function UnitResetButton({ courseId, sequenceUsageKey, unitUsageK
             const normalized = normalizeTimerPayload(startResponse?.data);
             setTimer(normalized);
             if (normalized.timerEnabled) loadRuntimeScript(lmsBaseUrl);
-            reloadUnitIframeOnce({
-              courseId,
-              unitUsageKey,
-              data: startResponse?.data || response?.data,
-              reason: 'quiz-session-reset-start',
-            });
+            if (hasFreshQuizSession(normalized)) {
+              reloadUnitIframeOnce({
+                courseId,
+                unitUsageKey,
+                data: startResponse?.data || response?.data,
+                reason: 'quiz-session-reset-start',
+              });
+            } else {
+              window.alert(normalized.message || 'Lượt làm mới chưa sẵn sàng. Vui lòng tải lại trang sau khi hết thời gian chờ.');
+              await loadTimerStatus();
+            }
             return;
           } catch (startError) {
             // Last-resort fallback: reload the whole MFE if the explicit start endpoint is unavailable.
@@ -323,12 +334,20 @@ export default function UnitResetButton({ courseId, sequenceUsageKey, unitUsageK
           if (response?.data?.success === true || response?.data?.ok === true) {
             try {
               const startResponse = await startQuizSession(client, lmsBaseUrl, quizSessionPayload);
-              reloadUnitIframeOnce({
-                courseId,
-                unitUsageKey,
-                data: startResponse?.data || response?.data,
-                reason: 'quiz-session-reset-fallback-start',
-              });
+              const normalized = normalizeTimerPayload(startResponse?.data);
+              setTimer(normalized);
+              if (normalized.timerEnabled) loadRuntimeScript(lmsBaseUrl);
+              if (hasFreshQuizSession(normalized)) {
+                reloadUnitIframeOnce({
+                  courseId,
+                  unitUsageKey,
+                  data: startResponse?.data || response?.data,
+                  reason: 'quiz-session-reset-fallback-start',
+                });
+              } else {
+                window.alert(normalized.message || 'Lượt làm mới chưa sẵn sàng. Vui lòng tải lại trang sau khi hết thời gian chờ.');
+                await loadTimerStatus();
+              }
               return;
             } catch (startError) {
               window.location.reload();
