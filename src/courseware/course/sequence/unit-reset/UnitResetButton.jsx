@@ -85,6 +85,55 @@ function loadRuntimeScript(lmsBaseUrl) {
   document.body.appendChild(script);
 }
 
+function getTimerSessionToken(data) {
+  const session = data?.session || data?.quiz_session || {};
+  return data?.session_id
+    || data?.quiz_session_id
+    || data?.id
+    || session?.id
+    || data?.attempt_no
+    || session?.attempt_no
+    || data?.started_at
+    || session?.started_at
+    || data?.expires_at
+    || session?.expires_at
+    || 'active';
+}
+
+function reloadUnitIframeOnce({ courseId, unitUsageKey, data, reason }) {
+  const iframe = document.getElementById('unit-iframe');
+  const token = getTimerSessionToken(data);
+  const storageKey = `openedx-unit-reset:iframe-reloaded:${courseId}:${unitUsageKey}:${reason}:${token}`;
+
+  try {
+    if (window.sessionStorage.getItem(storageKey) === '1') return false;
+    window.sessionStorage.setItem(storageKey, '1');
+  } catch (error) {
+    // sessionStorage can be unavailable in strict browser modes. Reloading the iframe is still safe.
+  }
+
+  if (!iframe) {
+    window.location.reload();
+    return true;
+  }
+
+  const rawSrc = iframe.getAttribute('src') || iframe.src;
+  if (!rawSrc) {
+    window.location.reload();
+    return true;
+  }
+
+  const url = new URL(rawSrc, window.location.href);
+  url.searchParams.set('unit_reset_nonce', String(Date.now()));
+  url.searchParams.set('unit_reset_reason', reason);
+  iframe.src = url.toString();
+  return true;
+}
+
+async function startQuizSession(client, lmsBaseUrl, quizSessionPayload) {
+  return client.post(`${lmsBaseUrl}/api/unit-reset/v1/quiz-session/start`, quizSessionPayload);
+}
+
 function broadcastAutoSubmitToProblemFrames(lmsBaseUrl) {
   const message = { type: 'AI_QUIZ_TIMEOUT_AUTO_SUBMIT' };
   const lmsOrigin = (() => {
@@ -117,10 +166,20 @@ export default function UnitResetButton({ courseId, sequenceUsageKey, unitUsageK
       setTimerLoading(true);
       if (startIfNeeded) {
         try {
-          const startResponse = await client.post(`${lmsBaseUrl}/api/unit-reset/v1/quiz-session/start`, quizSessionPayload);
+          const startResponse = await startQuizSession(client, lmsBaseUrl, quizSessionPayload);
           const normalized = normalizeTimerPayload(startResponse?.data);
           setTimer(normalized);
-          if (normalized.timerEnabled) loadRuntimeScript(lmsBaseUrl);
+          if (normalized.timerEnabled) {
+            loadRuntimeScript(lmsBaseUrl);
+            // The LMS unit iframe may render before the ACTIVE quiz session exists.
+            // Reload it once after a successful start so CAPA/problem JS initializes against fresh state.
+            reloadUnitIframeOnce({
+              courseId,
+              unitUsageKey,
+              data: startResponse?.data,
+              reason: 'quiz-session-start',
+            });
+          }
           return;
         } catch (startError) {
           if (![404, 405].includes(startError?.response?.status)) throw startError;
@@ -231,6 +290,25 @@ export default function UnitResetButton({ courseId, sequenceUsageKey, unitUsageK
       const endpoint = timer?.timerEnabled ? `${lmsBaseUrl}/api/unit-reset/v1/quiz-session/reset` : `${lmsBaseUrl}/api/unit-reset/v1/reset/`;
       const response = await client.post(endpoint, quizSessionPayload);
       if (response?.data?.success === true || response?.data?.ok === true) {
+        if (timer?.timerEnabled) {
+          try {
+            const startResponse = await startQuizSession(client, lmsBaseUrl, quizSessionPayload);
+            const normalized = normalizeTimerPayload(startResponse?.data);
+            setTimer(normalized);
+            if (normalized.timerEnabled) loadRuntimeScript(lmsBaseUrl);
+            reloadUnitIframeOnce({
+              courseId,
+              unitUsageKey,
+              data: startResponse?.data || response?.data,
+              reason: 'quiz-session-reset-start',
+            });
+            return;
+          } catch (startError) {
+            // Last-resort fallback: reload the whole MFE if the explicit start endpoint is unavailable.
+            window.location.reload();
+            return;
+          }
+        }
         window.location.reload();
         return;
       }
@@ -243,8 +321,19 @@ export default function UnitResetButton({ courseId, sequenceUsageKey, unitUsageK
           const lmsBaseUrl = getLmsBaseUrl();
           const response = await client.post(`${lmsBaseUrl}/api/unit-reset/v1/reset/`, quizSessionPayload);
           if (response?.data?.success === true || response?.data?.ok === true) {
-            window.location.reload();
-            return;
+            try {
+              const startResponse = await startQuizSession(client, lmsBaseUrl, quizSessionPayload);
+              reloadUnitIframeOnce({
+                courseId,
+                unitUsageKey,
+                data: startResponse?.data || response?.data,
+                reason: 'quiz-session-reset-fallback-start',
+              });
+              return;
+            } catch (startError) {
+              window.location.reload();
+              return;
+            }
           }
         } catch (fallbackError) { /* continue */ }
       }
@@ -296,7 +385,3 @@ export default function UnitResetButton({ courseId, sequenceUsageKey, unitUsageK
     </div>
   );
 }
-
-UnitResetButton.defaultProps = {
-  sequenceUsageKey: null,
-};
