@@ -75,15 +75,18 @@ function normalizeTimerPayload(data) {
     || data?.configured
     || config?.enabled
     || expiresAt
-    || rawRemaining !== null,
+    || (rawRemaining !== null && rawRemaining !== undefined),
   );
   return {
     timerEnabled,
     status,
     remainingSeconds: rawRemaining === null || rawRemaining === undefined ? null : Math.max(0, Math.floor(Number(rawRemaining || 0))),
     cooldownSeconds: rawCooldown === null || rawCooldown === undefined ? 0 : Math.max(0, Math.floor(Number(rawCooldown || 0))),
-    autoSubmitOnTimeout: data?.auto_submit_on_timeout ?? config?.auto_submit_on_timeout ?? true,
-    lockAfterTimeout: data?.lock_after_timeout ?? config?.lock_after_timeout ?? true,
+    // v25.9.16.5.32 policy: a configured timed quiz always auto-submits
+    // and locks locally after timeout. This prevents old Quiz configs that were
+    // created with unchecked UI options from silently disabling auto-submit.
+    autoSubmitOnTimeout: true,
+    lockAfterTimeout: true,
     expiresAt,
     resetAvailableAt: data?.reset_available_at || session?.reset_available_at || null,
     serverNow: data?.server_now || session?.server_now || null,
@@ -228,18 +231,15 @@ async function startQuizSession(client, lmsBaseUrl, quizSessionPayload) {
   return client.post(`${lmsBaseUrl}/api/unit-reset/v1/quiz-session/start`, quizSessionPayload);
 }
 
-function broadcastAutoSubmitToProblemFrames(lmsBaseUrl, quizSessionPayload) {
+function broadcastAutoSubmitToProblemFrames(quizSessionPayload) {
   const message = {
     type: 'AI_QUIZ_TIMEOUT_API_SUBMIT',
     course_id: quizSessionPayload?.course_id,
     sequence_usage_key: quizSessionPayload?.sequence_usage_key,
     unit_usage_key: quizSessionPayload?.unit_usage_key,
   };
-  const lmsOrigin = (() => {
-    try { return new URL(lmsBaseUrl).origin; } catch (error) { return window.location.origin; }
-  })();
   Array.from(document.querySelectorAll('iframe')).forEach((frame) => {
-    try { frame.contentWindow?.postMessage(message, lmsOrigin); } catch (error) { /* ignore cross-origin frame access */ }
+    try { frame.contentWindow?.postMessage(message, '*'); } catch (error) { /* ignore cross-origin frame access */ }
   });
 }
 
@@ -343,7 +343,7 @@ export default function UnitResetButton({ courseId, sequenceUsageKey, unitUsageK
             resolve(Number(event.data.submitted_problem_count || 0));
           };
           window.addEventListener('message', done);
-          broadcastAutoSubmitToProblemFrames(lmsBaseUrl, quizSessionPayload);
+          broadcastAutoSubmitToProblemFrames(quizSessionPayload);
           window.setTimeout(() => {
             if (!resolved) {
               window.removeEventListener('message', done);
@@ -473,7 +473,12 @@ export default function UnitResetButton({ courseId, sequenceUsageKey, unitUsageK
     }
   };
 
-  const showTimer = timer?.timerEnabled && timer.remainingSeconds !== null && timer.remainingSeconds !== undefined;
+  // Only render the timed quiz panel after the LMS plugin confirms this unit
+  // has an active/configured quiz timer. Non-timed videos/html units must not
+  // show the reset action, otherwise "Làm lại bài" appears across the course.
+  if (timerUnavailable || !timer?.timerEnabled) return null;
+
+  const showTimer = timer.remainingSeconds !== null && timer.remainingSeconds !== undefined;
   const isExpired = showTimer && timer.remainingSeconds <= 0;
   const cooldownSeconds = timer?.cooldownSeconds || 0;
   const isUrgent = showTimer && !isExpired && timer.remainingSeconds <= 60;
