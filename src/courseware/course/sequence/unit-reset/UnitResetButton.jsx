@@ -2,6 +2,8 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { getAuthenticatedHttpClient } from '@edx/frontend-platform/auth';
 import { getConfig } from '@edx/frontend-platform';
 
+import './UnitResetButton.scss';
+
 function getLmsBaseUrl() {
   const config = getConfig();
   return config.LMS_BASE_URL || config.LMS_BASE_URL_LEGACY || window.location.origin.replace('apps.', '');
@@ -33,6 +35,17 @@ function secondsUntil(dateString) {
   const target = new Date(dateString).getTime();
   if (Number.isNaN(target)) return null;
   return Math.max(0, Math.floor((target - Date.now()) / 1000));
+}
+
+function refreshTimerFromWallClock(current) {
+  if (!current) return current;
+  const nextRemaining = current.expiresAt ? secondsUntil(current.expiresAt) : current.remainingSeconds;
+  const nextCooldown = current.resetAvailableAt ? secondsUntil(current.resetAvailableAt) : current.cooldownSeconds;
+  return {
+    ...current,
+    remainingSeconds: nextRemaining === null || nextRemaining === undefined ? current.remainingSeconds : nextRemaining,
+    cooldownSeconds: nextCooldown === null || nextCooldown === undefined ? current.cooldownSeconds : nextCooldown,
+  };
 }
 
 function normalizeTimerPayload(data) {
@@ -71,6 +84,9 @@ function normalizeTimerPayload(data) {
     cooldownSeconds: rawCooldown === null || rawCooldown === undefined ? 0 : Math.max(0, Math.floor(Number(rawCooldown || 0))),
     autoSubmitOnTimeout: data?.auto_submit_on_timeout ?? config?.auto_submit_on_timeout ?? true,
     lockAfterTimeout: data?.lock_after_timeout ?? config?.lock_after_timeout ?? true,
+    expiresAt,
+    resetAvailableAt: data?.reset_available_at || session?.reset_available_at || null,
+    serverNow: data?.server_now || session?.server_now || null,
     message: data?.message || session?.message || '',
   };
 }
@@ -212,12 +228,16 @@ async function startQuizSession(client, lmsBaseUrl, quizSessionPayload) {
   return client.post(`${lmsBaseUrl}/api/unit-reset/v1/quiz-session/start`, quizSessionPayload);
 }
 
-function broadcastAutoSubmitToProblemFrames(lmsBaseUrl) {
-  const message = { type: 'AI_QUIZ_TIMEOUT_AUTO_SUBMIT' };
+function broadcastAutoSubmitToProblemFrames(lmsBaseUrl, quizSessionPayload) {
+  const message = {
+    type: 'AI_QUIZ_TIMEOUT_API_SUBMIT',
+    course_id: quizSessionPayload?.course_id,
+    sequence_usage_key: quizSessionPayload?.sequence_usage_key,
+    unit_usage_key: quizSessionPayload?.unit_usage_key,
+  };
   const lmsOrigin = (() => {
     try { return new URL(lmsBaseUrl).origin; } catch (error) { return window.location.origin; }
   })();
-  window.postMessage(message, window.location.origin);
   Array.from(document.querySelectorAll('iframe')).forEach((frame) => {
     try { frame.contentWindow?.postMessage(message, lmsOrigin); } catch (error) { /* ignore cross-origin frame access */ }
   });
@@ -229,6 +249,7 @@ export default function UnitResetButton({ courseId, sequenceUsageKey, unitUsageK
   const [timerUnavailable, setTimerUnavailable] = useState(false);
   const [timer, setTimer] = useState(null);
   const timeoutHandledRef = useRef(false);
+  const initialStartDoneRef = useRef(false);
 
   const quizSessionPayload = {
     course_id: courseId,
@@ -249,16 +270,10 @@ export default function UnitResetButton({ courseId, sequenceUsageKey, unitUsageK
           setTimer(normalized);
           if (normalized.timerEnabled) {
             loadRuntimeScript(lmsBaseUrl);
-            if (hasFreshQuizSession(normalized)) {
-              // The LMS unit iframe may render before the ACTIVE quiz session exists.
-              // Reload it once only after the server confirms a fresh usable session.
-              reloadUnitIframeOnce({
-                courseId,
-                unitUsageKey,
-                data: startResponse?.data,
-                reason: 'quiz-session-start',
-              });
-            }
+            // Do not hard-remount the iframe on the first page entry. In Ulmo MFE
+            // this can race the initial XBlock render and leave a blank unit until F5.
+            // Hard remount is reserved for explicit reset/start after "Làm lại bài".
+            initialStartDoneRef.current = true;
           }
           return;
         } catch (startError) {
@@ -284,24 +299,29 @@ export default function UnitResetButton({ courseId, sequenceUsageKey, unitUsageK
     setTimerUnavailable(false);
     setTimer(null);
     timeoutHandledRef.current = false;
+    initialStartDoneRef.current = false;
   }, [courseId, unitUsageKey, sequenceUsageKey]);
 
   useEffect(() => { loadTimerStatus({ startIfNeeded: true }); }, [loadTimerStatus]);
 
   useEffect(() => {
     if (!timer?.timerEnabled || timer.remainingSeconds === null || timer.remainingSeconds === undefined) return undefined;
-    const interval = window.setInterval(() => {
-      setTimer((current) => {
-        if (!current || current.remainingSeconds === null || current.remainingSeconds === undefined) return current;
-        return {
-          ...current,
-          remainingSeconds: Math.max(0, current.remainingSeconds - 1),
-          cooldownSeconds: Math.max(0, current.cooldownSeconds - 1),
-        };
-      });
-    }, 1000);
-    return () => window.clearInterval(interval);
-  }, [timer?.timerEnabled, timer?.remainingSeconds]);
+    const tick = () => setTimer((current) => refreshTimerFromWallClock(current));
+    const interval = window.setInterval(tick, 1000);
+    const onVisible = () => {
+      tick();
+      if (document.visibilityState === 'visible') loadTimerStatus();
+    };
+    const onFocus = () => { tick(); loadTimerStatus(); };
+    document.addEventListener('visibilitychange', onVisible);
+    window.addEventListener('focus', onFocus);
+    tick();
+    return () => {
+      window.clearInterval(interval);
+      document.removeEventListener('visibilitychange', onVisible);
+      window.removeEventListener('focus', onFocus);
+    };
+  }, [timer?.timerEnabled, timer?.expiresAt, timer?.resetAvailableAt, loadTimerStatus]);
 
   useEffect(() => {
     if (!timer?.timerEnabled || timer.remainingSeconds !== 0 || timeoutHandledRef.current) return;
@@ -317,35 +337,34 @@ export default function UnitResetButton({ courseId, sequenceUsageKey, unitUsageK
         submittedProblemCount = await new Promise((resolve) => {
           let resolved = false;
           const done = (event) => {
-            if (event?.data?.type !== 'AI_QUIZ_TIMEOUT_AUTO_SUBMIT_DONE') return;
+            if (event?.data?.type !== 'AI_QUIZ_TIMEOUT_API_SUBMIT_DONE') return;
             resolved = true;
             window.removeEventListener('message', done);
             resolve(Number(event.data.submitted_problem_count || 0));
           };
           window.addEventListener('message', done);
-          broadcastAutoSubmitToProblemFrames(lmsBaseUrl);
+          broadcastAutoSubmitToProblemFrames(lmsBaseUrl, quizSessionPayload);
           window.setTimeout(() => {
             if (!resolved) {
               window.removeEventListener('message', done);
               resolve(0);
             }
-          }, 8000);
+          }, 15000);
         });
       }
-      if (timer.lockAfterTimeout) {
-        try {
-          await client.post(`${lmsBaseUrl}/api/unit-reset/v1/quiz-session/lock`, {
-            ...quizSessionPayload,
-            submitted_problem_count: submittedProblemCount,
-            auto_submit_done: true,
-          });
-        } catch (error) { /* server guard still blocks late submits */ }
-      }
+      try {
+        await client.post(`${lmsBaseUrl}/api/unit-reset/v1/quiz-session/lock`, {
+          ...quizSessionPayload,
+          submitted_problem_count: submittedProblemCount,
+          auto_submit_done: true,
+          auto_submit_mode: 'problem_check_api',
+        });
+      } catch (error) { /* server guard still blocks late submits after grace */ }
       setTimer((current) => current ? {
         ...current,
         status: 'EXPIRED',
         remainingSeconds: 0,
-        message: 'Đã hết giờ. Hệ thống đã tự nộp các câu bạn đã chọn và khóa lượt làm này.',
+        message: 'Đã hết giờ. Hệ thống đã gửi nộp bài qua API cho các câu bạn đã chọn.',
       } : current);
       await loadTimerStatus();
     };
@@ -431,8 +450,12 @@ export default function UnitResetButton({ courseId, sequenceUsageKey, unitUsageK
         } catch (fallbackError) { /* continue */ }
       }
       if (data?.code === 'RESET_COOLDOWN' || data?.error_code === 'cooldown_not_expired') {
-        const waitSeconds = data?.wait_seconds || data?.remaining_seconds || data?.cooldown_remaining_seconds || 0;
-        window.alert(`Bạn cần chờ thêm ${formatWaitTime(waitSeconds)} để làm lại bài.`);
+        const waitSeconds = Number(data?.wait_seconds || data?.remaining_seconds || data?.cooldown_remaining_seconds || 0);
+        if (waitSeconds <= 0) {
+          window.alert('Đã hết thời gian chờ. Vui lòng bấm Làm lại bài một lần nữa.');
+        } else {
+          window.alert(`Bạn cần chờ thêm ${formatWaitTime(waitSeconds)} để làm lại bài.`);
+        }
         await loadTimerStatus();
         return;
       }
@@ -453,28 +476,80 @@ export default function UnitResetButton({ courseId, sequenceUsageKey, unitUsageK
   const showTimer = timer?.timerEnabled && timer.remainingSeconds !== null && timer.remainingSeconds !== undefined;
   const isExpired = showTimer && timer.remainingSeconds <= 0;
   const cooldownSeconds = timer?.cooldownSeconds || 0;
+  const isUrgent = showTimer && !isExpired && timer.remainingSeconds <= 60;
+  const isCoolingDown = cooldownSeconds > 0;
+  const timerStatus = String(timer?.status || '').toUpperCase();
+  const isLocked = ['EXPIRED', 'LOCKED', 'RESET_WAIT'].includes(timerStatus) || isExpired;
+  const panelTitle = isExpired || isLocked ? 'Đã hết giờ' : 'Thời gian làm bài';
+  const panelDescription = isExpired || isLocked
+    ? 'Hệ thống đã tự nộp các câu bạn đã chọn và khóa lượt làm này.'
+    : isUrgent
+      ? 'Sắp hết giờ. Hãy kiểm tra lại đáp án trước khi hệ thống tự nộp.'
+      : 'Hệ thống sẽ tự nộp bài khi hết thời gian.';
+  const wrapperClassName = [
+    'unit-reset-panel',
+    isExpired || isLocked ? 'unit-reset-panel--expired' : '',
+    isUrgent ? 'unit-reset-panel--urgent' : '',
+    isCoolingDown ? 'unit-reset-panel--cooldown' : '',
+    timerLoading ? 'unit-reset-panel--syncing' : '',
+  ].filter(Boolean).join(' ');
+  const statusId = `unit-reset-status-${unitUsageKey || 'unit'}`.replace(/[^a-zA-Z0-9_-]/g, '-');
 
   return (
-    <div className="unit-reset-wrapper my-3 p-3 border rounded bg-light">
-      {showTimer && (
-        <div className="d-flex flex-wrap align-items-center justify-content-between mb-3">
-          <div>
-            <div className="small text-muted">Quiz tự luyện</div>
-            <div className="font-weight-bold">{isExpired ? 'Đã hết giờ' : 'Thời gian còn lại'}</div>
-          </div>
-          <div className={`h4 mb-0 ${isExpired ? 'text-danger' : 'text-primary'}`}>{formatClock(timer.remainingSeconds)}</div>
+    <section
+      className={wrapperClassName}
+      aria-live="polite"
+      aria-describedby={statusId}
+      data-timer-status={timerStatus || 'UNKNOWN'}
+    >
+      <div className="unit-reset-panel__main">
+        <div className="unit-reset-panel__icon" aria-hidden="true">
+          {isExpired || isLocked ? '!' : '⏱'}
         </div>
-      )}
-      {showTimer && isExpired && (
-        <div className="alert alert-warning py-2 mb-3">Đã hết giờ. Hệ thống đã tự nộp các câu bạn đã chọn và khóa lượt làm này.</div>
-      )}
-      {cooldownSeconds > 0 && (
-        <div className="small text-muted mb-2">Bạn có thể làm lại sau: <strong>{formatWaitTime(cooldownSeconds)}</strong></div>
-      )}
-      <button type="button" className="btn btn-outline-primary" onClick={handleReset} disabled={loading}>
-        {loading ? 'Đang xử lý...' : 'Làm lại bài'}
-      </button>
-      {timerLoading && <span className="small text-muted ml-2">Đang tải thời gian...</span>}
-    </div>
+
+        <div className="unit-reset-panel__content">
+          <div className="unit-reset-panel__eyebrow">Quiz tự luyện</div>
+          <div className="unit-reset-panel__title">{panelTitle}</div>
+          <div id={statusId} className="unit-reset-panel__description">
+            {panelDescription}
+          </div>
+
+          {isCoolingDown && (
+            <div className="unit-reset-panel__cooldown">
+              Có thể làm lại sau: <strong>{formatWaitTime(cooldownSeconds)}</strong>
+            </div>
+          )}
+
+          {timerLoading && (
+            <div className="unit-reset-panel__sync" role="status" aria-live="polite">
+              <span className="spinner-border spinner-border-sm unit-reset-panel__spinner" aria-hidden="true" />
+              <span>Đang đồng bộ phiên làm bài...</span>
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="unit-reset-panel__actions">
+        {showTimer && (
+          <div className="unit-reset-panel__clock" aria-label={`Thời gian còn lại ${formatClock(timer.remainingSeconds)}`}>
+            {formatClock(timer.remainingSeconds)}
+          </div>
+        )}
+
+        <button
+          type="button"
+          className="btn btn-outline-primary unit-reset-panel__reset-btn"
+          onClick={handleReset}
+          disabled={loading}
+        >
+          {loading ? (
+            <>
+              <span className="spinner-border spinner-border-sm unit-reset-panel__spinner" aria-hidden="true" />
+              <span>Đang xử lý...</span>
+            </>
+          ) : 'Làm lại bài'}
+        </button>
+      </div>
+    </section>
   );
 }
