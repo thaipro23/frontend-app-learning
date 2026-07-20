@@ -151,6 +151,67 @@ function getUnitIframes(unitUsageKey) {
   return candidates;
 }
 
+
+function targetOriginForFrame(frame) {
+  const rawSrc = getFrameSrc(frame);
+  if (!rawSrc) return window.location.origin;
+  try { return new URL(rawSrc, window.location.href).origin; } catch (error) { return window.location.origin; }
+}
+
+
+function normalizeThemeVariant(value) {
+  const raw = String(value || '').trim().toLowerCase();
+  if (!raw) return '';
+  if (raw.includes('dark')) return 'dark';
+  if (raw.includes('light')) return 'light';
+  return raw;
+}
+
+function detectHostThemeVariant() {
+  const html = document.documentElement;
+  const body = document.body;
+  const explicit = html?.getAttribute('data-paragon-theme-variant')
+    || html?.getAttribute('data-bs-theme')
+    || html?.getAttribute('data-theme')
+    || body?.getAttribute('data-paragon-theme-variant')
+    || body?.getAttribute('data-bs-theme')
+    || body?.getAttribute('data-theme');
+  if (explicit) return String(explicit).trim();
+
+  const classText = `${html?.className || ''} ${body?.className || ''}`.toLowerCase();
+  if (classText.includes('dark')) return 'dark';
+  if (classText.includes('light')) return 'light';
+
+  try {
+    const colorScheme = window.getComputedStyle(html).colorScheme || window.getComputedStyle(body).colorScheme;
+    const normalized = normalizeThemeVariant(colorScheme);
+    if (normalized) return normalized;
+  } catch (error) { /* ignore */ }
+
+  return window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+}
+
+function postIframeUiContract(frame, unitUsageKey, reason = 'sync') {
+  if (!frame?.contentWindow) return;
+  const themeVariant = detectHostThemeVariant();
+  const theme = normalizeThemeVariant(themeVariant) === 'dark' ? 'dark' : 'light';
+  const origin = targetOriginForFrame(frame);
+  try {
+    frame.contentWindow.postMessage({
+      type: 'AI_MFE_THEME_SYNC',
+      theme,
+      theme_variant: themeVariant || theme,
+      unit_usage_key: unitUsageKey,
+      reason,
+    }, origin);
+    frame.contentWindow.postMessage({
+      type: 'AI_MFE_REQUEST_RESIZE',
+      unit_usage_key: unitUsageKey,
+      reason,
+    }, origin);
+  } catch (error) { /* ignore cross-origin lifecycle races */ }
+}
+
 function postActiveSessionReloadToFrames({ unitUsageKey, reason, token }) {
   const message = {
     type: 'AI_QUIZ_ACTIVE_SESSION_READY_RELOAD',
@@ -159,7 +220,7 @@ function postActiveSessionReloadToFrames({ unitUsageKey, reason, token }) {
     token: String(token || Date.now()),
   };
   Array.from(document.querySelectorAll('iframe')).forEach((frame) => {
-    try { frame.contentWindow?.postMessage(message, '*'); } catch (error) { /* ignore cross-origin frame access */ }
+    try { frame.contentWindow?.postMessage(message, targetOriginForFrame(frame)); } catch (error) { /* ignore cross-origin frame access */ }
   });
 }
 
@@ -239,7 +300,7 @@ function broadcastAutoSubmitToProblemFrames(quizSessionPayload) {
     unit_usage_key: quizSessionPayload?.unit_usage_key,
   };
   Array.from(document.querySelectorAll('iframe')).forEach((frame) => {
-    try { frame.contentWindow?.postMessage(message, '*'); } catch (error) { /* ignore cross-origin frame access */ }
+    try { frame.contentWindow?.postMessage(message, targetOriginForFrame(frame)); } catch (error) { /* ignore cross-origin frame access */ }
   });
 }
 
@@ -301,6 +362,94 @@ export default function UnitResetButton({ courseId, sequenceUsageKey, unitUsageK
     timeoutHandledRef.current = false;
     initialStartDoneRef.current = false;
   }, [courseId, unitUsageKey, sequenceUsageKey]);
+
+  // Synchronize the Paragon theme into the cross-origin LMS XBlock iframe on
+  // first load (not only after the user toggles dark/light), and explicitly ask
+  // the iframe to report its height after asynchronous problem feedback changes.
+  useEffect(() => {
+    const boundFrames = new Map();
+    const timers = [];
+    let stopped = false;
+    let queued = null;
+
+    const bindFrame = (frame) => {
+      if (!frame || boundFrames.has(frame)) return;
+      const onLoad = () => {
+        [0, 80, 250, 700].forEach((delay) => {
+          const id = window.setTimeout(() => {
+            if (!stopped) postIframeUiContract(frame, unitUsageKey, 'iframe-load');
+          }, delay);
+          timers.push(id);
+        });
+      };
+      frame.addEventListener('load', onLoad);
+      boundFrames.set(frame, onLoad);
+      postIframeUiContract(frame, unitUsageKey, 'bind');
+    };
+
+    const syncAll = (reason) => {
+      if (stopped) return;
+      getUnitIframes(unitUsageKey).forEach((frame) => {
+        bindFrame(frame);
+        postIframeUiContract(frame, unitUsageKey, reason);
+      });
+    };
+
+    const queueSync = (reason) => {
+      if (queued) window.clearTimeout(queued);
+      queued = window.setTimeout(() => {
+        queued = null;
+        syncAll(reason);
+      }, 40);
+    };
+
+    const observer = new MutationObserver((records) => {
+      const relevant = records.some((record) => {
+        if (record.type === 'attributes') {
+          return record.target === document.documentElement || record.target === document.body;
+        }
+        return Array.from(record.addedNodes || []).some((node) => node?.tagName === 'IFRAME' || node?.querySelector?.('iframe'));
+      });
+      if (relevant) queueSync('dom-or-theme-change');
+    });
+    observer.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ['class', 'style', 'data-paragon-theme-variant', 'data-bs-theme', 'data-theme'],
+      childList: true,
+      subtree: true,
+    });
+
+    const onStorage = () => queueSync('storage-theme-change');
+    const onVisible = () => { if (document.visibilityState === 'visible') queueSync('visible'); };
+    const onMessage = (event) => {
+      if (event?.data?.type !== 'AI_QUIZ_IFRAME_READY') return;
+      const frame = getUnitIframes(unitUsageKey).find((candidate) => candidate.contentWindow === event.source);
+      if (frame) postIframeUiContract(frame, unitUsageKey, 'iframe-ready');
+    };
+    window.addEventListener('storage', onStorage);
+    window.addEventListener('message', onMessage);
+    document.addEventListener('visibilitychange', onVisible);
+
+    const media = window.matchMedia?.('(prefers-color-scheme: dark)');
+    const onMedia = () => queueSync('system-theme-change');
+    media?.addEventListener?.('change', onMedia);
+
+    [0, 120, 500, 1500].forEach((delay) => {
+      timers.push(window.setTimeout(() => syncAll('initial'), delay));
+    });
+
+    return () => {
+      stopped = true;
+      observer.disconnect();
+      if (queued) window.clearTimeout(queued);
+      timers.forEach((id) => window.clearTimeout(id));
+      boundFrames.forEach((onLoad, frame) => frame.removeEventListener('load', onLoad));
+      window.removeEventListener('storage', onStorage);
+      window.removeEventListener('message', onMessage);
+      document.removeEventListener('visibilitychange', onVisible);
+      media?.removeEventListener?.('change', onMedia);
+    };
+  }, [unitUsageKey]);
 
   useEffect(() => { loadTimerStatus({ startIfNeeded: true }); }, [loadTimerStatus]);
 
