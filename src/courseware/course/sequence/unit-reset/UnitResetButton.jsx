@@ -164,46 +164,118 @@ function normalizeThemeVariant(value) {
   if (!raw) return '';
   if (raw.includes('dark')) return 'dark';
   if (raw.includes('light')) return 'light';
-  return raw;
+  return '';
+}
+
+function themeVariantFromPersistedPreference() {
+  try {
+    for (let index = 0; index < window.localStorage.length; index += 1) {
+      const key = String(window.localStorage.key(index) || '');
+      if (!/(paragon|theme|appearance|color.?scheme)/i.test(key)) continue;
+      const rawValue = window.localStorage.getItem(key);
+      const simpleValue = String(rawValue || '').trim().replace(/^['"]|['"]$/g, '').toLowerCase();
+      if (simpleValue === 'dark' || simpleValue === 'light') return simpleValue;
+      try {
+        const parsed = JSON.parse(rawValue);
+        const candidates = [
+          parsed?.themeVariant,
+          parsed?.theme_variant,
+          parsed?.variant,
+          parsed?.theme,
+          parsed?.appearance,
+          parsed?.colorScheme,
+          parsed?.color_scheme,
+          parsed?.value,
+        ];
+        const matched = candidates.map(normalizeThemeVariant).find(Boolean);
+        if (matched) return matched;
+      } catch (error) { /* value is not JSON */ }
+    }
+  } catch (error) { /* localStorage can be blocked */ }
+  return '';
+}
+
+function themeVariantFromActiveStylesheets() {
+  try {
+    const links = Array.from(document.querySelectorAll('link[rel="stylesheet"]'));
+    const active = links.filter((link) => {
+      if (link.disabled) return false;
+      const media = String(link.media || '').trim();
+      if (!media || media.toLowerCase() === 'all') return true;
+      if (media.toLowerCase() === 'not all') return false;
+      try { return window.matchMedia(media).matches; } catch (error) { return true; }
+    });
+    const darkLink = active.find((link) => /(^|[\/_.-])dark([\/_.-]|$)/i.test(String(link.href || '')));
+    if (darkLink) return 'dark';
+    const lightLink = active.find((link) => /(^|[\/_.-])light([\/_.-]|$)/i.test(String(link.href || '')));
+    if (lightLink) return 'light';
+  } catch (error) { /* ignore stylesheet lifecycle races */ }
+  return '';
+}
+
+function themeVariantFromRenderedSurface() {
+  const candidates = [
+    document.querySelector('main'),
+    document.querySelector('#root'),
+    document.body,
+    document.documentElement,
+  ].filter(Boolean);
+  for (const element of candidates) {
+    try {
+      const value = window.getComputedStyle(element).backgroundColor;
+      const match = String(value || '').match(/rgba?\(\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)(?:\s*,\s*(\d+(?:\.\d+)?))?\s*\)/i);
+      if (!match) continue;
+      const alpha = match[4] === undefined ? 1 : Number(match[4]);
+      if (alpha < 0.5) continue;
+      const [red, green, blue] = [Number(match[1]), Number(match[2]), Number(match[3])];
+      const luminance = (0.2126 * red + 0.7152 * green + 0.0722 * blue) / 255;
+      return luminance < 0.45 ? 'dark' : 'light';
+    } catch (error) { /* ignore */ }
+  }
+  return '';
 }
 
 function detectHostThemeVariant() {
   const html = document.documentElement;
   const body = document.body;
   const explicit = html?.getAttribute('data-paragon-theme-variant')
-    || html?.getAttribute('data-bs-theme')
-    || html?.getAttribute('data-theme')
     || body?.getAttribute('data-paragon-theme-variant')
+    || html?.getAttribute('data-bs-theme')
     || body?.getAttribute('data-bs-theme')
+    || html?.getAttribute('data-theme')
     || body?.getAttribute('data-theme');
-  if (explicit) return String(explicit).trim();
+  const explicitVariant = normalizeThemeVariant(explicit);
+  if (explicitVariant) return explicitVariant;
+
+  const persisted = themeVariantFromPersistedPreference();
+  if (persisted) return persisted;
 
   const classText = `${html?.className || ''} ${body?.className || ''}`.toLowerCase();
-  if (classText.includes('dark')) return 'dark';
-  if (classText.includes('light')) return 'light';
+  const classVariant = normalizeThemeVariant(classText);
+  if (classVariant) return classVariant;
 
-  try {
-    const colorScheme = window.getComputedStyle(html).colorScheme || window.getComputedStyle(body).colorScheme;
-    const normalized = normalizeThemeVariant(colorScheme);
-    if (normalized) return normalized;
-  } catch (error) { /* ignore */ }
+  const stylesheetVariant = themeVariantFromActiveStylesheets();
+  if (stylesheetVariant) return stylesheetVariant;
 
-  return window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  return themeVariantFromRenderedSurface();
 }
 
 function postIframeUiContract(frame, unitUsageKey, reason = 'sync') {
   if (!frame?.contentWindow) return;
   const themeVariant = detectHostThemeVariant();
-  const theme = normalizeThemeVariant(themeVariant) === 'dark' ? 'dark' : 'light';
   const origin = targetOriginForFrame(frame);
   try {
-    frame.contentWindow.postMessage({
-      type: 'AI_MFE_THEME_SYNC',
-      theme,
-      theme_variant: themeVariant || theme,
-      unit_usage_key: unitUsageKey,
-      reason,
-    }, origin);
+    // Never guess from prefers-color-scheme here. The MFE theme preference is
+    // authoritative and may intentionally differ from the operating system.
+    if (themeVariant) {
+      frame.contentWindow.postMessage({
+        type: 'AI_MFE_THEME_SYNC',
+        theme: themeVariant,
+        theme_variant: themeVariant,
+        unit_usage_key: unitUsageKey,
+        reason,
+      }, origin);
+    }
     frame.contentWindow.postMessage({
       type: 'AI_MFE_REQUEST_RESIZE',
       unit_usage_key: unitUsageKey,
@@ -420,6 +492,9 @@ export default function UnitResetButton({ courseId, sequenceUsageKey, unitUsageK
     });
 
     const onStorage = () => queueSync('storage-theme-change');
+    const onThemeStylesheetLoad = (event) => {
+      if (event?.target?.tagName === 'LINK' && event.target.rel === 'stylesheet') queueSync('theme-stylesheet-load');
+    };
     const onVisible = () => { if (document.visibilityState === 'visible') queueSync('visible'); };
     const onMessage = (event) => {
       if (event?.data?.type !== 'AI_QUIZ_IFRAME_READY') return;
@@ -429,13 +504,13 @@ export default function UnitResetButton({ courseId, sequenceUsageKey, unitUsageK
     window.addEventListener('storage', onStorage);
     window.addEventListener('message', onMessage);
     document.addEventListener('visibilitychange', onVisible);
+    document.addEventListener('load', onThemeStylesheetLoad, true);
 
-    const media = window.matchMedia?.('(prefers-color-scheme: dark)');
-    const onMedia = () => queueSync('system-theme-change');
-    media?.addEventListener?.('change', onMedia);
-
-    [0, 120, 500, 1500].forEach((delay) => {
-      timers.push(window.setTimeout(() => syncAll('initial'), delay));
+    // Paragon may restore the persisted theme after this component mounts. Poll
+    // until its html attribute or active stylesheet is available; do not fall
+    // back to the operating-system preference because it can disagree with CMS.
+    [0, 60, 160, 400, 900, 1800, 3500, 6000].forEach((delay) => {
+      timers.push(window.setTimeout(() => syncAll('initial-theme-settle'), delay));
     });
 
     return () => {
@@ -447,7 +522,7 @@ export default function UnitResetButton({ courseId, sequenceUsageKey, unitUsageK
       window.removeEventListener('storage', onStorage);
       window.removeEventListener('message', onMessage);
       document.removeEventListener('visibilitychange', onVisible);
-      media?.removeEventListener?.('change', onMedia);
+      document.removeEventListener('load', onThemeStylesheetLoad, true);
     };
   }, [unitUsageKey]);
 
